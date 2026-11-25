@@ -619,8 +619,11 @@ async function buildAttempts() {
     { device: 'wasm',   dtype: 'q4' },
   ];
 }
-async function loadModel() {
-  const myId = ++loadId;
+// Only one model may load at a time. Two concurrent loads (e.g. the user
+// switches models mid-download) each spin up a full ONNX session, and on
+// WASM that's exactly what crashes the engine with "Aborted()".
+let inFlight = null;
+async function runLoad(myId) {
   generator = null; loadedDevice = null;
   showLoading(true);
   promptEl.disabled = sendBtn.disabled = true;
@@ -643,7 +646,7 @@ async function loadModel() {
   for (const { device, dtype } of attempts) {
     try {
       const g = await pipeline('text-generation', model.id, { device, dtype, progress_callback: onProgress });
-      if (myId !== loadId) return;   // a newer load started, drop this one
+      if (myId !== loadId) { try { g.dispose?.(); } catch {} return; }   // a newer load started, drop this one
       generator = g; loadedDevice = device;
       showLoading(false);
       document.querySelector('.brand .sub').textContent = model.name;
@@ -665,9 +668,21 @@ async function loadModel() {
   $('model-dot').className = 'dot bad';
   $('model-text').textContent = 'Load failed';
   $('setup-title').textContent = 'That didn\'t work';
-  $('setup-hint').textContent = 'Check your connection and try again. ' + (lastErr?.message || '');
+  const rawMsg = String(lastErr?.message || lastErr || '');
+  const hint = /abort/i.test(rawMsg)
+    ? 'The AI engine crashed while starting (usually a memory hiccup). Reload the page and try again — if it keeps happening, switch Engine to CPU in Settings.'
+    : 'Check your connection and try again.';
+  $('setup-hint').textContent = hint + (rawMsg ? ' (' + rawMsg.slice(0, 140) + ')' : '');
   $('progress-wrap').hidden = true;
   $('retry-btn').hidden = false;
+}
+function loadModel() {
+  loadId++;
+  const prev = inFlight || Promise.resolve();
+  const p = prev.catch(() => {}).then(() => runLoad(loadId)).catch(e => console.error('load error:', e));
+  inFlight = p;
+  p.finally(() => { if (inFlight === p) inFlight = null; });
+  return p;
 }
 function reloadModel() {
   if (generating) stopper?.interrupt();
@@ -829,6 +844,20 @@ function finishEdit(doSave) {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+function buildPrompt(history) {
+  // Manual ChatML — the exact template Qwen2.5/Qwen3 speak. Needed as a
+  // fallback because some community repos (e.g. the heretic variant) ship a
+  // tokenizer with no chat template saved, and apply_chat_template()
+  // then refuses to build the prompt at all.
+  let p = '<|im_start|>system\n' + SYSTEM_PROMPT + '<|im_end|>\n';
+  for (const m of history) {
+    p += `<|im_start|>${m.role}\n${String(m.content ?? '')}<|im_end|>\n`;
+  }
+  p += '<|im_start|>assistant\n';
+  if (currentModel().noThink) p += '<think>\n\n</think>\n\n';   // Qwen3: pre-fill an empty think block
+  return p;
+}
+
 /* ---------------- generation ---------------- */
 async function runGeneration() {
   if (!generator || generating) return;
@@ -865,12 +894,21 @@ async function runGeneration() {
     // Keep the prompt bounded: the last 16 turns max, so long chats don't
     // slow generation to a crawl on a 0.5B model.
     const history = chatHistory.length > 16 ? chatHistory.slice(-16) : chatHistory;
-    const tplOpts = { add_generation_prompt: true, tokenize: false };
-    if (currentModel().noThink) tplOpts.enable_thinking = false;   // Qwen3: skip the <think> reasoning
-    const prompt = gen.tokenizer.apply_chat_template(
-      [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
-      tplOpts
-    );
+    let prompt = null;
+    if (gen.tokenizer.chat_template) {
+      try {
+        const tplOpts = { add_generation_prompt: true, tokenize: false };
+        if (currentModel().noThink) tplOpts.enable_thinking = false;   // Qwen3: skip the <think> reasoning
+        prompt = gen.tokenizer.apply_chat_template(
+          [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
+          tplOpts
+        );
+      } catch (e) {
+        console.warn('apply_chat_template failed, using fallback:', e);
+        prompt = null;
+      }
+    }
+    if (!prompt) prompt = buildPrompt(history);
     await gen(prompt, { max_new_tokens: 512, do_sample: true, temperature: 0.7, top_p: 0.9, streamer, stopping_criteria: stopper });
   } catch (err) {
     console.error(err);
