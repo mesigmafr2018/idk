@@ -344,6 +344,7 @@
       <div class="progress-label" id="progress-label">Starting…</div>
     </div>
     <button class="btn primary" id="retry-btn" hidden>Try again</button>
+    <button class="btn" id="wipe-btn" hidden>Clear downloaded files</button>
   </div>
 
   <div class="card" id="chat-card" hidden>
@@ -385,13 +386,19 @@
 <script type="module">
 import { pipeline, TextStreamer, StoppingCriteria, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6';
 
+const APP_VERSION = '2026-11-26.4';
+console.log('[SI] app version', APP_VERSION, '— if this doesn\'t print, the browser is running a stale copy of the page.');
+
 env.allowLocalModels = false;
 
 const MODELS = [
   { key: 'qwen25-05b',       name: 'Qwen 2.5 · 0.5B',     size: '0.5–0.8 GB', id: 'onnx-community/Qwen2.5-0.5B-Instruct' },
   { key: 'qwen3-06b',        name: 'Qwen 3 · 0.6B',       size: '0.6–0.9 GB', id: 'onnx-community/Qwen3-0.6B-ONNX', noThink: true },
   { key: 'qwen25-05b-alt',   name: 'Qwen 2.5 · 0.5B Alt', size: '0.5–0.8 GB', id: 'onnx-community/Qwen2.5-0.5B-Instruct-abliterated-v3-ONNX' },
-  { key: 'qwen3-06b-alt',    name: 'Qwen 3 · 0.6B Alt',   size: '0.6–1.0 GB', id: 'onnx-community/Qwen3-0.6B-heretic-abliterated-uncensored-ONNX', noThink: true },
+  // NOTE: the "Qwen 3 · 0.6B Alt" (heretic) repo was removed on purpose —
+  // its ONNX export has no KV-cache outputs (verified byte-level), so every
+  // generation crashes with "Cannot read properties of undefined (reading
+  // 'dims')". No working uncensored Qwen3 ONNX repo exists to replace it.
 ];
 const SYSTEM_PROMPT =
   'You are a helpful AI assistant that runs entirely on the user\'s device. ' +
@@ -416,6 +423,7 @@ const emptyEl = $('empty');
 let settings = { ...DEFAULTS };
 try { Object.assign(settings, JSON.parse(localStorage.getItem('si-settings')) || {}); } catch {}
 if (!MODELS.some(m => m.key === settings.model)) settings.model = DEFAULTS.model;   // clean up stale saved models
+let oomFallbackUsed = false;   // only auto-switch to the small model once per page
 const saveSettings = () => { try { localStorage.setItem('si-settings', JSON.stringify(settings)); } catch {} };
 const currentModel = () => MODELS.find(m => m.key === settings.model) || MODELS[0];
 
@@ -543,6 +551,7 @@ function buildModelSelect() {
 buildModelSelect();
 $('model-select').addEventListener('change', e => {
   if (e.target.value === settings.model) return;
+  oomFallbackUsed = false;   // manual pick — respect it even if it failed before
   settings.model = e.target.value; saveSettings(); syncSettingsUI(); reloadModel();
 });
 if (!hasGPU) { $('seg-gpu').disabled = true; $('seg-gpu').title = 'WebGPU not available in this browser'; if (settings.device === 'webgpu') settings.device = 'auto'; }
@@ -623,6 +632,19 @@ async function buildAttempts() {
 // switches models mid-download) each spin up a full ONNX session, and on
 // WASM that's exactly what crashes the engine with "Aborted()".
 let inFlight = null;
+let abortStrikes = 0;
+// transformers.js stores downloaded model files in the browser Cache API
+// under a name containing "transformers". A shard that was saved during a
+// crashed download stays damaged forever, and every retry re-reads it and
+// crashes with "Aborted()" again — clearing the cache is the fix.
+async function clearModelCache() {
+  try {
+    if (typeof caches === 'undefined') return false;   // not available on some origins
+    const keys = await caches.keys();
+    await Promise.all(keys.filter(k => k.toLowerCase().includes('transformers')).map(k => caches.delete(k)));
+    return true;
+  } catch { return false; }
+}
 async function runLoad(myId) {
   generator = null; loadedDevice = null;
   showLoading(true);
@@ -648,6 +670,8 @@ async function runLoad(myId) {
       const g = await pipeline('text-generation', model.id, { device, dtype, progress_callback: onProgress });
       if (myId !== loadId) { try { g.dispose?.(); } catch {} return; }   // a newer load started, drop this one
       generator = g; loadedDevice = device;
+      abortStrikes = 0;
+      oomFallbackUsed = false;
       showLoading(false);
       document.querySelector('.brand .sub').textContent = model.name;
       $('model-dot').className = 'dot ok';
@@ -665,16 +689,44 @@ async function runLoad(myId) {
     }
   }
   if (myId !== loadId) return;
+  const rawMsg = String(lastErr?.message || lastErr || '');
+  const isOOM = /failed to allocate|out of memory/i.test(rawMsg);
+  // Not enough RAM for the chosen model: automatically retry with the
+  // smallest one (once per page), instead of dead-ending the user.
+  if (isOOM && settings.model !== MODELS[0].key && !oomFallbackUsed) {
+    oomFallbackUsed = true;
+    const bigName = model.name;
+    settings.model = MODELS[0].key;
+    saveSettings(); syncSettingsUI();
+    $('model-dot').className = 'dot warn';
+    $('model-text').textContent = 'Out of memory';
+    $('setup-title').textContent = 'That model needs more memory';
+    $('setup-hint').textContent = `${bigName} needed ${model.size} of memory and your device didn't have enough free. Loading the smaller ${MODELS[0].name} instead…`;
+    $('progress-wrap').hidden = true;
+    loadModel();
+    return;
+  }
   $('model-dot').className = 'dot bad';
   $('model-text').textContent = 'Load failed';
   $('setup-title').textContent = 'That didn\'t work';
-  const rawMsg = String(lastErr?.message || lastErr || '');
-  const hint = /abort/i.test(rawMsg)
-    ? 'The AI engine crashed while starting (usually a memory hiccup). Reload the page and try again — if it keeps happening, switch Engine to CPU in Settings.'
-    : 'Check your connection and try again.';
+  const isAbort = /abort/i.test(rawMsg);
+  let hint;
+  if (isAbort) {
+    abortStrikes++;
+    hint = 'The AI engine crashed while starting. That can be a memory hiccup or a damaged download.';
+    if (abortStrikes >= 2) {
+      const wiped = await clearModelCache();
+      hint += wiped
+        ? ' It kept happening, so I cleared the downloaded files — try again and it will re-download fresh.'
+        : ' If this keeps happening, reload the page and try a different model or engine.';
+    }
+  } else {
+    hint = 'Check your connection and try again.';
+  }
   $('setup-hint').textContent = hint + (rawMsg ? ' (' + rawMsg.slice(0, 140) + ')' : '');
   $('progress-wrap').hidden = true;
   $('retry-btn').hidden = false;
+  $('wipe-btn').hidden = false;
 }
 function loadModel() {
   loadId++;
@@ -689,6 +741,12 @@ function reloadModel() {
   loadModel();
 }
 $('retry-btn').addEventListener('click', loadModel);
+$('wipe-btn').addEventListener('click', async () => {
+  $('wipe-btn').textContent = 'Clearing…';
+  $('wipe-btn').disabled = true;
+  await clearModelCache();
+  location.reload();
+});
 
 /* ---------------- tiny markdown ---------------- */
 const escapeHtml = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -914,7 +972,10 @@ async function runGeneration() {
     console.error(err);
     errored = true;
     bubble.className = 'msg error';
-    bubble.textContent = 'Generation error: ' + (err.message || err);
+    const msg = String(err?.message || err);
+    bubble.textContent = /reading 'dims'|reading "dims"/i.test(msg)
+      ? 'This model\'s file is broken (it was exported without chat support). Pick a different model in Settings.'
+      : 'Generation error: ' + msg;
   } finally {
     generating = false;
     stopBtn.hidden = true;
