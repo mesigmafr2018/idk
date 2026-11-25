@@ -276,7 +276,7 @@
     <div class="logo">🧀</div>
     <div>
       <h1>Private SI</h1>
-      <div class="sub">tiny SI that lives in your browser</div>
+      <div class="sub">tiny AI that lives in your browser</div>
     </div>
   </div>
   <div class="head-right">
@@ -314,7 +314,7 @@
   <div class="set-section">
     <div class="set-title">Model</div>
     <div class="set-row col">
-      <span>Which SI runs in your browser</span>
+      <span>Which AI runs in your browser</span>
       <select id="model-select"></select>
     </div>
     <div class="set-note">The size shown is the download — bigger models give better answers but run slower. Each one downloads once, then loads from cache. All of these stay small on purpose, so nothing crashes.</div>
@@ -337,7 +337,7 @@
 <main>
   <div class="card" id="setup">
     <div class="cheese">🧀</div>
-    <h2 id="setup-title">Waking up the SI…</h2>
+    <h2 id="setup-title">Waking up the AI…</h2>
     <p id="setup-hint">Downloading the model to your browser. First time only, after that it loads from cache.</p>
     <div class="progress-wrap" id="progress-wrap">
       <div class="progress-bar"><div class="progress-fill indeterminate" id="progress-fill"></div></div>
@@ -389,11 +389,14 @@ env.allowLocalModels = false;
 
 const MODELS = [
   { key: 'qwen25-05b',       name: 'Qwen 2.5 · 0.5B',     size: '0.5–0.8 GB', id: 'onnx-community/Qwen2.5-0.5B-Instruct' },
-  { key: 'qwen3-06b',        name: 'Qwen 3 · 0.6B',       size: '0.6–0.9 GB', id: 'onnx-community/Qwen3-0.6B-ONNX' },
+  { key: 'qwen3-06b',        name: 'Qwen 3 · 0.6B',       size: '0.6–0.9 GB', id: 'onnx-community/Qwen3-0.6B-ONNX', noThink: true },
   { key: 'qwen25-05b-alt',   name: 'Qwen 2.5 · 0.5B Alt', size: '0.5–0.8 GB', id: 'onnx-community/Qwen2.5-0.5B-Instruct-abliterated-v3-ONNX' },
-  { key: 'qwen3-06b-alt',    name: 'Qwen 3 · 0.6B Alt',   size: '0.6–1.0 GB', id: 'onnx-community/Qwen3-0.6B-heretic-abliterated-uncensored-ONNX' },
+  { key: 'qwen3-06b-alt',    name: 'Qwen 3 · 0.6B Alt',   size: '0.6–1.0 GB', id: 'onnx-community/Qwen3-0.6B-heretic-abliterated-uncensored-ONNX', noThink: true },
 ];
-const SYSTEM_PROMPT = "You are a helpful AI assistant. Be clear, simple, and honest.";
+const SYSTEM_PROMPT =
+  'You are a helpful AI assistant that runs entirely on the user\'s device. ' +
+  'Answer clearly and concisely. Use markdown: bullet points for lists, **bold** for key ideas, ' +
+  'and code blocks for code. If you are unsure about something, say so honestly instead of guessing.';
 
 const COLORS = ['#ffcf33', '#ff7a1a', '#ff5fa2', '#a66cff', '#3fa7ff', '#2ee6a6', '#b6f21f', '#ff4d4d'];
 const DEFAULTS = { accent: '#ffcf33', mode: 'dark', device: 'auto', model: 'qwen25-05b' };
@@ -604,13 +607,14 @@ function showLoading(on) {
   $('chat-card').hidden = on;
 }
 async function buildAttempts() {
-  // Ordered list of (device, dtype) combos to try. q4f16 is ~35% smaller to
-  // download and faster on WebGPU; plain q4 is the safe fallback, then CPU.
+  // Ordered list of (device, dtype) combos to try. Plain q4 (int4 weights,
+  // fp32 compute) is deliberately used everywhere: q4f16's fp16 math breaks
+  // on many GPU drivers — either the load fails (error spam, re-downloads)
+  // or it silently returns NaN garbage text. CPU is the last fallback.
   if (settings.device === 'wasm' || !hasGPU) return [{ device: 'wasm', dtype: 'q4' }];
   const adapter = await checkGPU();
   if (!adapter) return [{ device: 'wasm', dtype: 'q4' }];
   return [
-    { device: 'webgpu', dtype: 'q4f16' },
     { device: 'webgpu', dtype: 'q4' },
     { device: 'wasm',   dtype: 'q4' },
   ];
@@ -840,11 +844,15 @@ async function runGeneration() {
   stats.className = 'stats';
   stopper = new InterruptableStoppingCriteria();
 
-  let text = '', tokenCount = 0, errored = false;
+  let raw = '', text = '', tokenCount = 0, errored = false;
+  // Safety net for thinking models (Qwen3): hide anything inside <think>…
+  // </think> and anything still being streamed inside an unclosed <think>.
+  const clean = s => s.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/<think>[\s\S]*$/, '');
   const streamer = new TextStreamer(gen.tokenizer, {
     skip_prompt: true, skip_special_tokens: true,
     callback_function: t => {
-      text += t;
+      raw += t;
+      text = clean(raw);
       bubble.innerHTML = miniMarkdown(text) + '<span class="cursor"></span>';
       bubble.appendChild(stats);
       chatEl.scrollTop = chatEl.scrollHeight;
@@ -857,9 +865,11 @@ async function runGeneration() {
     // Keep the prompt bounded: the last 16 turns max, so long chats don't
     // slow generation to a crawl on a 0.5B model.
     const history = chatHistory.length > 16 ? chatHistory.slice(-16) : chatHistory;
+    const tplOpts = { add_generation_prompt: true, tokenize: false };
+    if (currentModel().noThink) tplOpts.enable_thinking = false;   // Qwen3: skip the <think> reasoning
     const prompt = gen.tokenizer.apply_chat_template(
       [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
-      { add_generation_prompt: true, tokenize: false }
+      tplOpts
     );
     await gen(prompt, { max_new_tokens: 512, do_sample: true, temperature: 0.7, top_p: 0.9, streamer, stopping_criteria: stopper });
   } catch (err) {
@@ -875,6 +885,7 @@ async function runGeneration() {
     if (ready && matchMedia('(hover: hover)').matches) promptEl.focus();
 
     if (!errored) {
+      text = clean(raw);
       const secs = Math.max((performance.now() - t0) / 1000, 0.1);
       stats.textContent = `${tokenCount} tokens · ${(tokenCount / secs).toFixed(1)} tok/s · ${secs.toFixed(1)}s${stopper.interrupted ? ' · stopped' : ''}`;
       bubble.innerHTML = text.trim() ? miniMarkdown(text) : (stopper.interrupted ? '<i>(stopped)</i>' : '<i>(no output, try rephrasing)</i>');
